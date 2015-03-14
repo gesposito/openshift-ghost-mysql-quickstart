@@ -1,4 +1,4 @@
-# Update Cartdrige files
+# Update Ghost's Cartridge files
 #
 # chmod +x upgrade-ghost-openshift.sh
 # ./upgrade-ghost-openshift.sh

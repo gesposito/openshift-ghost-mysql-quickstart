@@ -1,6 +1,6 @@
 // # Users API
 // RESTful API for the User resource
-var when            = require('when'),
+var Promise         = require('bluebird'),
     _               = require('lodash'),
     dataProvider    = require('../models'),
     settings        = require('./settings'),
@@ -19,6 +19,7 @@ var when            = require('when'),
 
 // ## Helpers
 function prepareInclude(include) {
+    include = include || '';
     include = _.intersection(include.split(','), allowedIncludes);
     return include;
 }
@@ -26,9 +27,9 @@ function prepareInclude(include) {
 sendInviteEmail = function sendInviteEmail(user) {
     var emailData;
 
-    return when.join(
-        users.read({'id': user.created_by}),
-        settings.read({'key': 'title'}),
+    return Promise.join(
+        users.read({id: user.created_by}),
+        settings.read({key: 'title'}),
         settings.read({context: {internal: true}, key: 'dbHash'})
     ).then(function (values) {
         var invitedBy = values[0].users[0],
@@ -46,7 +47,7 @@ sendInviteEmail = function sendInviteEmail(user) {
     }).then(function (resetToken) {
         var baseUrl = config.forceAdminSSL ? (config.urlSSL || config.url) : config.url;
 
-        emailData.resetLink = baseUrl.replace(/\/$/, '') + '/ghost/signup/' + resetToken + '/';
+        emailData.resetLink = baseUrl.replace(/\/$/, '') + '/ghost/signup/' + globalUtils.encodeBase64URLsafe(resetToken) + '/';
 
         return mail.generateContent({data: emailData, template: 'invite-user'});
     }).then(function (emailContent) {
@@ -111,10 +112,10 @@ users = {
 
         return dataProvider.User.findOne(data, options).then(function (result) {
             if (result) {
-                return { users: [result.toJSON()] };
+                return {users: [result.toJSON()]};
             }
 
-            return when.reject(new errors.NotFoundError('User not found.'));
+            return Promise.reject(new errors.NotFoundError('User not found.'));
         });
     },
 
@@ -134,44 +135,55 @@ users = {
             options.include = prepareInclude(options.include);
         }
 
-        return utils.checkObject(object, docName).then(function (data) {
+        return utils.checkObject(object, docName, options.id).then(function (data) {
             // Edit operation
             editOperation = function () {
                 return dataProvider.User.edit(data.users[0], options)
                     .then(function (result) {
                         if (result) {
-                            return { users: [result.toJSON()]};
+                            return {users: [result.toJSON()]};
                         }
 
-                        return when.reject(new errors.NotFoundError('User not found.'));
+                        return Promise.reject(new errors.NotFoundError('User not found.'));
                     });
             };
 
             // Check permissions
             return canThis(options.context).edit.user(options.id).then(function () {
-                if (data.users[0].roles && data.users[0].roles[0]) {
-                    var role = data.users[0].roles[0],
-                        roleId = parseInt(role.id || role, 10);
+                // if roles aren't in the payload, proceed with the edit
+                if (!(data.users[0].roles && data.users[0].roles[0])) {
+                    return editOperation();
+                }
 
-                    return dataProvider.User.findOne(
-                        {id: options.context.user, status: 'all'}, {include: 'roles'}
-                    ).then(function (contextUser) {
-                        var contextRoleId = contextUser.related('roles').toJSON()[0].id;
+                var role = data.users[0].roles[0],
+                    roleId = parseInt(role.id || role, 10),
+                    editedUserId = parseInt(options.id, 10);
 
-                        if (roleId !== contextRoleId &&
-                                parseInt(options.id, 10) === parseInt(options.context.user, 10)) {
-                            return when.reject(new errors.NoPermissionError('You cannot change your own role.'));
-                        } else if (roleId !== contextRoleId) {
-                            return canThis(options.context).assign.role(role).then(function () {
-                                return editOperation();
-                            });
+                return dataProvider.User.findOne(
+                    {id: options.context.user, status: 'all'}, {include: ['roles']}
+                ).then(function (contextUser) {
+                    var contextRoleId = contextUser.related('roles').toJSON()[0].id;
+
+                    if (roleId !== contextRoleId && editedUserId === contextUser.id) {
+                        return Promise.reject(new errors.NoPermissionError('You cannot change your own role.'));
+                    }
+
+                    return dataProvider.User.findOne({role: 'Owner'}).then(function (owner) {
+                        if (contextUser.id !== owner.id) {
+                            if (editedUserId === owner.id) {
+                                if (owner.related('roles').at(0).id !== roleId) {
+                                    return Promise.reject(new errors.NoPermissionError('Cannot change Owner\'s role.'));
+                                }
+                            } else if (roleId !== contextRoleId) {
+                                return canThis(options.context).assign.role(role).then(function () {
+                                    return editOperation();
+                                });
+                            }
                         }
 
                         return editOperation();
                     });
-                }
-
-                return editOperation();
+                });
             });
         }).catch(function (error) {
             return errors.handleAPIError(error, 'You do not have permission to edit this user');
@@ -202,7 +214,7 @@ users = {
                     newUser.password = globalUtils.uid(50);
                     newUser.status = 'invited';
                 } else {
-                    return when.reject(new errors.BadRequestError('No email provided.'));
+                    return Promise.reject(new errors.BadRequestError('No email provided.'));
                 }
 
                 return dataProvider.User.getByEmail(
@@ -215,7 +227,7 @@ users = {
                         if (foundUser.get('status') === 'invited' || foundUser.get('status') === 'invited-pending') {
                             return foundUser;
                         } else {
-                            return when.reject(new errors.BadRequestError('User is already registered.'));
+                            return Promise.reject(new errors.BadRequestError('User is already registered.'));
                         }
                     }
                 }).then(function (invitedUser) {
@@ -231,7 +243,7 @@ users = {
                         });
                     }
                 }).then(function () {
-                    return when.resolve({users: [user]});
+                    return Promise.resolve({users: [user]});
                 }).catch(function (error) {
                     if (error && error.type === 'EmailError') {
                         error.message = 'Error sending email: ' + error.message + ' Please check your email settings and resend the invitation.';
@@ -239,12 +251,12 @@ users = {
 
                         // If sending the invitation failed, set status to invited-pending
                         return dataProvider.User.edit({status: 'invited-pending'}, {id: user.id}).then(function (user) {
-                            return dataProvider.User.findOne({ id: user.id, status: 'all' }, options).then(function (user) {
-                                return { users: [user] };
+                            return dataProvider.User.findOne({id: user.id, status: 'all'}, options).then(function (user) {
+                                return {users: [user]};
                             });
                         });
                     }
-                    return when.reject(error);
+                    return Promise.reject(error);
                 });
             };
 
@@ -256,7 +268,7 @@ users = {
                     // Make sure user is allowed to add a user with this role
                     return dataProvider.Role.findOne({id: roleId}).then(function (role) {
                         if (role.get('name') === 'Owner') {
-                            return when.reject(new errors.NoPermissionError('Not allowed to create an owner user.'));
+                            return Promise.reject(new errors.NoPermissionError('Not allowed to create an owner user.'));
                         }
 
                         return canThis(options.context).assign.role(role);
@@ -267,12 +279,10 @@ users = {
 
                 return addOperation();
             });
-
         }).catch(function (error) {
             return errors.handleAPIError(error, 'You do not have permission to add this user');
         });
     },
-
 
     /**
      * ### Destroy
@@ -281,10 +291,15 @@ users = {
      */
     destroy: function destroy(options) {
         return canThis(options.context).destroy.user(options.id).then(function () {
-            return users.read(_.merge(options, { status: 'all'})).then(function (result) {
+            return users.read(_.merge(options, {status: 'all'})).then(function (result) {
                 return dataProvider.Base.transaction(function (t) {
                     options.transacting = t;
-                    dataProvider.Post.destroyByAuthor(options).then(function () {
+
+                    Promise.all([
+                        dataProvider.Accesstoken.destroyByUser(options),
+                        dataProvider.Refreshtoken.destroyByUser(options),
+                        dataProvider.Post.destroyByAuthor(options)
+                    ]).then(function () {
                         return dataProvider.User.destroy(options);
                     }).then(function () {
                         t.commit();
@@ -294,7 +309,7 @@ users = {
                 }).then(function () {
                     return result;
                 }, function (error) {
-                    return when.reject(new errors.InternalServerError(error));
+                    return Promise.reject(new errors.InternalServerError(error));
                 });
             }, function (error) {
                 return errors.handleAPIError(error);
@@ -303,7 +318,6 @@ users = {
             return errors.handleAPIError(error, 'You do not have permission to destroy this user');
         });
     },
-
 
     /**
      * ### Change Password
@@ -314,17 +328,23 @@ users = {
     changePassword: function changePassword(object, options) {
         var oldPassword,
             newPassword,
-            ne2Password;
+            ne2Password,
+            userId;
+
         return utils.checkObject(object, 'password').then(function (checkedPasswordReset) {
             oldPassword = checkedPasswordReset.password[0].oldPassword;
             newPassword = checkedPasswordReset.password[0].newPassword;
             ne2Password = checkedPasswordReset.password[0].ne2Password;
-
-            return dataProvider.User.changePassword(oldPassword, newPassword, ne2Password, options).then(function () {
-                return when.resolve({password: [{message: 'Password changed successfully.'}]});
-            }).catch(function (error) {
-                return when.reject(new errors.ValidationError(error.message));
-            });
+            userId = parseInt(checkedPasswordReset.password[0].user_id);
+        }).then(function () {
+            return canThis(options.context).edit.user(userId);
+        }).then(function () {
+            return dataProvider.User.changePassword(oldPassword, newPassword, ne2Password, userId, options);
+        }).then(function () {
+            return Promise.resolve({password: [{message: 'Password changed successfully.'}]});
+        }).catch(function (error) {
+            // return Promise.reject(new errors.ValidationError(error.message));
+            return errors.handleAPIError(error, 'You do not have permission to change the password for this user');
         });
     },
 
@@ -337,9 +357,9 @@ users = {
         }).then(function () {
             return utils.checkObject(object, 'owner').then(function (checkedOwnerTransfer) {
                 return dataProvider.User.transferOwnership(checkedOwnerTransfer.owner[0], options).then(function (updatedUsers) {
-                    return when.resolve({ users: updatedUsers });
+                    return Promise.resolve({users: updatedUsers});
                 }).catch(function (error) {
-                    return when.reject(new errors.ValidationError(error.message));
+                    return Promise.reject(new errors.ValidationError(error.message));
                 });
             });
         }).catch(function (error) {
